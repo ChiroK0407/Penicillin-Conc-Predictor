@@ -1,0 +1,13 @@
+# Ignore virtual environments
+venv311/
+venv_lap/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore Streamlit cache
+.streamlit/
+
+# Ignore data files if too large
+Data/

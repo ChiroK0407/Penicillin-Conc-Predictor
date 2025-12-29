@@ -204,11 +204,6 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.exceptions import ConvergenceWarning
 import warnings
 
-try:
-    from xgboost import XGBRegressor
-except ImportError:
-    XGBRegressor = None
-
 def train_benchmark_model(df, target_col, model_type="rf", test_size=0.2,
                           sort_by_time=True, split_type="Time-ordered split"):
     df = preprocess_dataframe(df, target_col, sort_by_time=sort_by_time)
@@ -244,12 +239,15 @@ def train_benchmark_model(df, target_col, model_type="rf", test_size=0.2,
         y_pred = model.predict(X_test_scaled)
 
     elif model_type == "xgb":
-        if XGBRegressor is None:
-            raise ImportError("XGBoost not installed. Please install xgboost.")
-        model = XGBRegressor(n_estimators=200, learning_rate=0.1,
-                             max_depth=5, subsample=0.8, random_state=42)
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        model = HistGradientBoostingRegressor(
+            learning_rate=0.05,
+            max_iter=300,
+            random_state=42
+        )
         model.fit(X_train_scaled, y_train)
         y_pred = model.predict(X_test_scaled)
+
 
     else:
         raise ValueError(f"Unknown benchmark model type: {model_type}")
@@ -296,13 +294,13 @@ def autotune_benchmark_model(df, target_col, model_type="rf", k=3,
         ]
         ModelClass = MLPRegressor
     elif model_type == "xgb":
-        if XGBRegressor is None:
-            return None, None, None
         param_grid = [
-            {"n_estimators": 200, "learning_rate": 0.1, "max_depth": 5},
-            {"n_estimators": 300, "learning_rate": 0.05, "max_depth": 7},
+            {"learning_rate": 0.05, "max_iter": 200},
+            {"learning_rate": 0.1, "max_iter": 300},
+            {"learning_rate": 0.05, "max_iter": 500},
         ]
-        ModelClass = XGBRegressor
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        ModelClass = HistGradientBoostingRegressor
     else:
         return None, None, None
 

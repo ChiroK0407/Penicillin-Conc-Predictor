@@ -25,27 +25,104 @@ def time_ordered_split(X, y, test_size=0.2):
     y_train, y_test = y.iloc[:n_train], y.iloc[n_train:]
     return X_train, X_test, y_train, y_test
 
+from sklearn.impute import SimpleImputer
+
+def preprocess_general_testing(df, target_col, sort_by_time=True):
+    """
+    Preprocess mixed datasets for general testing:
+    - Drops rows with missing target values
+    - Sorts by 'time' column if present
+    - Converts datetime/timestamp strings into numeric features (hour, day, month)
+    - Keeps only numeric features
+    - Imputes missing values with column means
+    - Scales features
+    Returns: X_scaled, y, scaler, imputer
+    """
+    # Drop rows where target is NaN
+    df = df.dropna(subset=[target_col])
+
+    # Optional time ordering
+    if sort_by_time and "time" in df.columns:
+        df = df.sort_values(by="time").reset_index(drop=True)
+
+    # Separate features and target
+    X = df.drop(columns=[target_col])
+    y = df[target_col]
+
+    # Handle datetime/timestamp columns
+    for col in X.columns:
+        if pd.api.types.is_datetime64_any_dtype(X[col]):
+            X[col + "_hour"] = X[col].dt.hour
+            X[col + "_day"] = X[col].dt.day
+            X[col + "_month"] = X[col].dt.month
+            X = X.drop(columns=[col])
+        elif X[col].dtype == "object":
+            parsed = pd.to_datetime(X[col], errors="coerce")
+            if parsed.notna().sum() > 0.5 * len(parsed):  # keep only if majority parseable
+                X[col + "_hour"] = parsed.dt.hour
+                X[col + "_day"] = parsed.dt.day
+                X[col + "_month"] = parsed.dt.month
+            X = X.drop(columns=[col])
+
+
+    # Keep only numeric columns
+    X_num = X.select_dtypes(include=["number"])
+    X_num = X_num.dropna(axis=1, how="all")
+
+    # Impute missing values
+    imputer = SimpleImputer(strategy="mean")
+    X_num_imputed = imputer.fit_transform(X_num)
+
+    # Scale
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_num_imputed)
+
+    return X_scaled, y.values, scaler, imputer
+
 # -----------------------------
 # Unified Training function
 # -----------------------------
-def train_model(df, target_col, model_type="linear", test_size=0.2, sort_by_time=True, split_type="Time-ordered split"):
+from sklearn.impute import SimpleImputer
+
+def train_model(df, target_col, model_type="linear", test_size=0.2,
+                sort_by_time=True, split_type="Time-ordered split"):
+    # Preprocess
     df = preprocess_dataframe(df, target_col, sort_by_time=sort_by_time)
     X = df.drop(columns=[target_col])
     y = df[target_col]
 
-    # Choose split strategy
+    # 1) Drop columns that are entirely NaN globally
+    X = X.dropna(axis=1, how="all")
+
+    # Split
     if split_type == "Time-ordered split":
         X_train, X_test, y_train, y_test = time_ordered_split(X, y, test_size=test_size)
-    else:  # Random shuffle
+    else:
         from sklearn.model_selection import train_test_split
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=42
+        )
 
-    # Scale features
+    # 2) Numeric-only
+    X_train_num = X_train.select_dtypes(include=["number"])
+    X_test_num = X_test.select_dtypes(include=["number"])
+
+    # 3) Keep only columns with at least one observed value in TRAIN
+    nonempty_cols = X_train_num.columns[X_train_num.notna().any()]
+    X_train_num = X_train_num[nonempty_cols]
+    X_test_num = X_test_num[nonempty_cols]  # align columns to train
+
+    # 4) Impute NaNs (now all columns have at least one observed value in train)
+    imputer = SimpleImputer(strategy="mean")
+    X_train_imputed = imputer.fit_transform(X_train_num)
+    X_test_imputed = imputer.transform(X_test_num)
+
+    # 5) Scale
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    X_train_scaled = scaler.fit_transform(X_train_imputed)
+    X_test_scaled = scaler.transform(X_test_imputed)
 
-    # Choose model
+    # Model choice (unchanged)
     if model_type == "linear":
         model = SVR(kernel="linear", C=1.0, epsilon=0.1)
     elif model_type == "poly":
@@ -57,7 +134,8 @@ def train_model(df, target_col, model_type="linear", test_size=0.2, sort_by_time
     elif model_type == "poly_scratch":
         model = PolySVR_Scratch(lr=0.001, epochs=900, C=1.0, epsilon=0.02, degree=2)
     elif model_type == "rbf_scratch":
-        model = RBFSVRScratch(C=1.0, epsilon=0.02, gamma=None, lr=0.001, epochs=2000, mu=100.0)
+        model = RBFSVRScratch(C=1.0, epsilon=0.02, gamma=None,
+                              lr=0.001, epochs=2000, mu=100.0)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -74,11 +152,11 @@ def train_model(df, target_col, model_type="linear", test_size=0.2, sort_by_time
     return (
         model,
         {
-            "X_train": X_train,
+            "X_train": X_train,                 # raw DF for plotting
             "X_test": X_test,
             "y_train": y_train.values,
             "y_test": y_test.values,
-            "X_train_scaled": X_train_scaled,
+            "X_train_scaled": X_train_scaled,   # scaled arrays for training
             "X_test_scaled": X_test_scaled,
         },
         metrics,
@@ -88,17 +166,14 @@ def train_model(df, target_col, model_type="linear", test_size=0.2, sort_by_time
 # -----------------------------
 # Unified Auto-tune
 # -----------------------------
-def autotune_model(df, target_col, model_type="linear", k=3, sort_by_time=True, split_type="Time-ordered split"):
-    """
-    Lightweight auto-tune for all models.
-    For scikit-learn: vary C, epsilon, gamma, degree.
-    For scratch: vary lr, epochs, C, epsilon.
-    """
-    df = preprocess_dataframe(df, target_col, sort_by_time=sort_by_time)
-    X = df.drop(columns=[target_col]).values
-    y = df[target_col].values
+def autotune_model(df, target_col, model_type="linear", k=3,
+                   sort_by_time=True, split_type="Time-ordered split"):
+    # ✅ Preprocess once
+    X_scaled, y, scaler, imputer = preprocess_general_testing(
+        df, target_col, sort_by_time=sort_by_time
+    )
 
-    # Define param grids
+    # Define param grids + kernel
     if model_type == "linear":
         param_grid = [
             {"C": 0.5, "epsilon": 0.01},
@@ -129,46 +204,44 @@ def autotune_model(df, target_col, model_type="linear", k=3, sort_by_time=True, 
             {"lr": 0.003, "epochs": 1500, "C": 1.0, "epsilon": 0.02},
             {"lr": 0.005, "epochs": 2000, "C": 2.0, "epsilon": 0.01},
         ]
+        kernel = None
+
     elif model_type == "poly_scratch":
         param_grid = [
             {"lr": 0.001, "epochs": 900, "C": 1.0, "epsilon": 0.02, "degree": 2},
             {"lr": 0.002, "epochs": 1200, "C": 1.0, "epsilon": 0.02, "degree": 3},
         ]
+        kernel = None
+
     elif model_type == "rbf_scratch":
         param_grid = [
             {"lr": 0.001, "epochs": 1500, "C": 1.0, "epsilon": 0.02, "mu": 100.0},
             {"lr": 0.002, "epochs": 2000, "C": 2.0, "epsilon": 0.01, "mu": 50.0},
         ]
+        kernel = None
+
     else:
         return None, None, None
 
-    n_samples = len(X)
+    # k-fold CV
+    n_samples = len(X_scaled)
     fold_size = n_samples // k
     best_score = -float("inf")
-    best_config = None
-    best_metrics = None
+    best_config, best_metrics = None, None
 
-    # Loop over param combinations
     for params in param_grid:
-        fold_scores = []
-        fold_metrics = {"MSE": [], "MAE": [], "R2": []}
-
+        fold_scores, fold_metrics = [], {"MSE": [], "MAE": [], "R2": []}
         for fold in range(k):
             val_start = fold * fold_size
             val_end = val_start + fold_size if fold < k - 1 else n_samples
             val_idx = list(range(val_start, val_end))
             train_idx = list(range(0, val_start)) + list(range(val_end, n_samples))
 
-            X_train, y_train = X[train_idx], y[train_idx]
-            X_val, y_val = X[val_idx], y[val_idx]
-
-            # Scale features
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_val_scaled = scaler.transform(X_val)
+            X_train, y_train = X_scaled[train_idx], y[train_idx]
+            X_val, y_val = X_scaled[val_idx], y[val_idx]
 
             # Train model depending on type
-            if model_type in ["linear","poly","rbf"]:
+            if model_type in ["linear", "poly", "rbf"]:
                 model = SVR(kernel=kernel, **params)
             elif model_type == "linear_scratch":
                 model = LinearSVR_Scratch(**params)
@@ -177,8 +250,8 @@ def autotune_model(df, target_col, model_type="linear", k=3, sort_by_time=True, 
             elif model_type == "rbf_scratch":
                 model = RBFSVRScratch(**params)
 
-            model.fit(X_train_scaled, y_train)
-            y_pred = model.predict(X_val_scaled)
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_val)
 
             metrics = {
                 "MSE": mean_squared_error(y_val, y_pred),
@@ -193,9 +266,7 @@ def autotune_model(df, target_col, model_type="linear", k=3, sort_by_time=True, 
         avg_metrics = {key: float(np.mean(vals)) for key, vals in fold_metrics.items()}
 
         if avg_score > best_score:
-            best_score = avg_score
-            best_config = params
-            best_metrics = avg_metrics
+            best_score, best_config, best_metrics = avg_score, params, avg_metrics
 
     return best_config, best_metrics, best_score
 
@@ -204,13 +275,18 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.exceptions import ConvergenceWarning
 import warnings
 
+from sklearn.impute import SimpleImputer
+
 def train_benchmark_model(df, target_col, model_type="rf", test_size=0.2,
                           sort_by_time=True, split_type="Time-ordered split"):
     df = preprocess_dataframe(df, target_col, sort_by_time=sort_by_time)
     X = df.drop(columns=[target_col])
     y = df[target_col]
 
-    # Choose split strategy
+    # 1) Drop columns entirely NaN globally
+    X = X.dropna(axis=1, how="all")
+
+    # Split
     if split_type == "Time-ordered split":
         X_train, X_test, y_train, y_test = time_ordered_split(X, y, test_size=test_size)
     else:
@@ -219,23 +295,36 @@ def train_benchmark_model(df, target_col, model_type="rf", test_size=0.2,
             X, y, test_size=test_size, random_state=42
         )
 
-    # Scale features (MLP benefits, RF/XGB don’t strictly need it)
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    # 2) Numeric-only
+    X_train_num = X_train.select_dtypes(include=["number"])
+    X_test_num = X_test.select_dtypes(include=["number"])
 
-    # Choose model
+    # 3) Keep only columns with at least one observed value in TRAIN
+    nonempty_cols = X_train_num.columns[X_train_num.notna().any()]
+    X_train_num = X_train_num[nonempty_cols]
+    X_test_num = X_test_num[nonempty_cols]
+
+    # 4) Impute (RF/XGB don’t need scaling, but imputation helps if NaNs exist)
+    imputer = SimpleImputer(strategy="mean")
+    X_train_imputed = imputer.fit_transform(X_train_num)
+    X_test_imputed = imputer.transform(X_test_num)
+
+    # 5) Scale for models that need it
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_imputed)
+    X_test_scaled = scaler.transform(X_test_imputed)
+
+    # Model choice
     if model_type == "rf":
         model = RandomForestRegressor(n_estimators=100, random_state=42)
-        model.fit(X_train_scaled, y_train)   # train on arrays for consistency
-        y_pred = model.predict(X_test_scaled)
+        model.fit(X_train_num.values, y_train.values)  # RF: raw numeric (imputed via values above if needed)
+        y_pred = model.predict(X_test_num.values)
 
     elif model_type == "mlp":
-        # Suppress convergence warnings
         warnings.filterwarnings("ignore", category=ConvergenceWarning)
         model = MLPRegressor(hidden_layer_sizes=(100,), max_iter=2000,
                              solver="adam", random_state=42)
-        model.fit(X_train_scaled, y_train)
+        model.fit(X_train_scaled, y_train.values)
         y_pred = model.predict(X_test_scaled)
 
     elif model_type == "xgb":
@@ -245,17 +334,16 @@ def train_benchmark_model(df, target_col, model_type="rf", test_size=0.2,
             max_iter=300,
             random_state=42
         )
-        model.fit(X_train_scaled, y_train)
-        y_pred = model.predict(X_test_scaled)
-
+        model.fit(X_train_num.values, y_train.values)
+        y_pred = model.predict(X_test_num.values)
 
     else:
         raise ValueError(f"Unknown benchmark model type: {model_type}")
 
     metrics = {
-        "MSE": mean_squared_error(y_test, y_pred),
-        "MAE": mean_absolute_error(y_test, y_pred),
-        "R2": r2_score(y_test, y_pred),
+        "MSE": mean_squared_error(y_test.values, y_pred),
+        "MAE": mean_absolute_error(y_test.values, y_pred),
+        "R2": r2_score(y_test.values, y_pred),
     }
 
     return (
@@ -274,25 +362,30 @@ def train_benchmark_model(df, target_col, model_type="rf", test_size=0.2,
 
 def autotune_benchmark_model(df, target_col, model_type="rf", k=3,
                              sort_by_time=True, split_type="Time-ordered split"):
-    df = preprocess_dataframe(df, target_col, sort_by_time=sort_by_time)
-    X = df.drop(columns=[target_col]).values
-    y = df[target_col].values
+    # ✅ Preprocess once
+    X_scaled, y, scaler, imputer = preprocess_general_testing(
+        df, target_col, sort_by_time=sort_by_time
+    )
 
-    # Simple param grids
+    # Param grids
     if model_type == "rf":
         param_grid = [
             {"n_estimators": 100, "max_depth": None},
             {"n_estimators": 200, "max_depth": 10},
             {"n_estimators": 300, "max_depth": 20},
         ]
+        from sklearn.ensemble import RandomForestRegressor
         ModelClass = RandomForestRegressor
+
     elif model_type == "mlp":
         param_grid = [
             {"hidden_layer_sizes": (50,), "max_iter": 500},
             {"hidden_layer_sizes": (100,), "max_iter": 500},
             {"hidden_layer_sizes": (100, 50), "max_iter": 1000},
         ]
+        from sklearn.neural_network import MLPRegressor
         ModelClass = MLPRegressor
+
     elif model_type == "xgb":
         param_grid = [
             {"learning_rate": 0.05, "max_iter": 200},
@@ -301,11 +394,12 @@ def autotune_benchmark_model(df, target_col, model_type="rf", k=3,
         ]
         from sklearn.ensemble import HistGradientBoostingRegressor
         ModelClass = HistGradientBoostingRegressor
+
     else:
         return None, None, None
 
     # k-fold CV
-    n_samples = len(X)
+    n_samples = len(X_scaled)
     fold_size = n_samples // k
     best_score = -float("inf")
     best_config, best_metrics = None, None
@@ -318,21 +412,17 @@ def autotune_benchmark_model(df, target_col, model_type="rf", k=3,
             val_idx = list(range(val_start, val_end))
             train_idx = list(range(0, val_start)) + list(range(val_end, n_samples))
 
-            X_train, y_train = X[train_idx], y[train_idx]
-            X_val, y_val = X[val_idx], y[val_idx]
+            X_train, y_train = X_scaled[train_idx], y[train_idx]
+            X_val, y_val = X_scaled[val_idx], y[val_idx]
 
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_val_scaled = scaler.transform(X_val)
-
-            if model_type == "rf" or model_type == "xgb":
+            if model_type in ["rf", "xgb"]:
                 model = ModelClass(**params, random_state=42)
                 model.fit(X_train, y_train)
                 y_pred = model.predict(X_val)
             else:  # mlp
                 model = ModelClass(**params, random_state=42)
-                model.fit(X_train_scaled, y_train)
-                y_pred = model.predict(X_val_scaled)
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_val)
 
             metrics = {
                 "MSE": mean_squared_error(y_val, y_pred),

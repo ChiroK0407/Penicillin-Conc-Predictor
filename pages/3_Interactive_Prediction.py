@@ -48,6 +48,9 @@ if uploaded:
                 df, target_col, model_choice, split_type=split_type
             )
 
+        from backend.model_utils_ip import wrap_scaled_array
+        X_train_df = wrap_scaled_array(data["X_train_scaled"], df, target_col)
+
         st.session_state.base_model = model
         st.session_state.base_data = data
         st.session_state.base_metrics = metrics
@@ -56,13 +59,13 @@ if uploaded:
         # Extract feature importances
         if hasattr(model, "coef_"):
             importances = np.array(model.coef_).flatten()
-            feature_names = data["X_train"].columns
         elif hasattr(model, "feature_importances_"):
             importances = np.array(model.feature_importances_).flatten()
-            feature_names = data["X_train"].columns
         else:
             importances = np.var(data["X_train"], axis=0)
-            feature_names = data["X_train"].columns
+
+        # Always use the wrapped DataFrame’s column names
+        feature_names = X_train_df.columns
 
         # Normalize and rank
         importances = np.abs(importances)
